@@ -74,12 +74,16 @@ func DefaultSchemaTemplates(cf *client.Factory,
 }
 
 // DefaultSchemaTemplatesForStore returns the same default templates as DefaultSchemaTemplates, only using DefaultSchemaTemplateFoStore internally to construct the templates.
-func DefaultSchemaTemplatesForStore(store types.Store,
+func DefaultSchemaTemplatesForStore(cf *client.Factory,
+	store types.Store,
 	baseSchemas *types.APISchemas,
 	summaryCache *summarycache.SummaryCache,
 	lookup accesscontrol.AccessSetLookup,
 	discovery discovery.DiscoveryInterface,
+	namespaceCache corecontrollers.NamespaceCache,
 	options common.TemplateOptions) []schema.Template {
+
+	defaultTemplate := common.DefaultTemplate(cf, summaryCache, lookup, namespaceCache, options)
 
 	return []schema.Template{
 		common.DefaultTemplateForStore(store, summaryCache, lookup, options),
@@ -101,6 +105,14 @@ func DefaultSchemaTemplatesForStore(store types.Store,
 			Customize: func(apiSchema *types.APISchema) {
 				cluster.AddApply(baseSchemas, apiSchema)
 			},
+		},
+		{
+			ID:    "metrics.k8s.io.nodemetrics",
+			Store: defaultTemplate.Store,
+		},
+		{
+			ID:    "metrics.k8s.io.podmetrics",
+			Store: defaultTemplate.Store,
 		},
 	}
 }
