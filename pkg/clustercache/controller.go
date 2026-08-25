@@ -127,7 +127,6 @@ func (h *clusterCache) addResourceEventHandler(gvk schema2.GroupVersionKind, inf
 
 func (h *clusterCache) OnSchemas(schemas *schema.Collection) error {
 	h.Lock()
-	defer h.Unlock()
 
 	var (
 		gvks   = map[schema2.GroupVersionKind]bool{}
@@ -182,18 +181,43 @@ func (h *clusterCache) OnSchemas(schemas *schema.Collection) error {
 		}
 	}
 
+	h.Unlock()
+
+	// Wait for each newly-registered watcher's initial sync in its own
+	// goroutine, outside the write lock. OnSchemas must not block Get/List
+	// (which take RLock) or subsequent schema refreshes on a resource whose
+	// cache is slow to sync or never does (e.g. a CRD/APIService that briefly
+	// 404s right after being registered).
 	for _, w := range toWait {
-		ctx, cancel := context.WithTimeout(w.ctx, 15*time.Minute)
-		if !cache.WaitForCacheSync(ctx.Done(), w.informer.HasSynced) {
-			logrus.Errorf("failed to sync cache for %v", w.gvk)
-			cancel()
-			w.cancel()
-			delete(h.watchers, w.gvk)
-		}
-		cancel()
+		go h.waitForSync(w)
 	}
 
 	return nil
+}
+
+func (h *clusterCache) waitForSync(w *watcher) {
+	ctx, cancel := context.WithTimeout(w.ctx, 15*time.Minute)
+	defer cancel()
+
+	if cache.WaitForCacheSync(ctx.Done(), w.informer.HasSynced) {
+		return
+	}
+	if w.ctx.Err() != nil {
+		// Watcher was already stopped by a later schema refresh (e.g. the
+		// resource is no longer valid) — not a genuine sync failure.
+		return
+	}
+
+	logrus.Errorf("failed to sync cache for %v", w.gvk)
+
+	h.Lock()
+	defer h.Unlock()
+	// Only remove if this is still the current watcher for the GVK — a later
+	// refresh may have already replaced or removed it.
+	if h.watchers[w.gvk] == w {
+		w.cancel()
+		delete(h.watchers, w.gvk)
+	}
 }
 
 func (h *clusterCache) Get(gvk schema2.GroupVersionKind, namespace, name string) (interface{}, bool, error) {
