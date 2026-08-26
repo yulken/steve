@@ -22,8 +22,10 @@ import (
 	"k8s.io/client-go/util/workqueue"
 )
 
-type Handler func(gvr schema2.GroupVersionKind, key string, obj runtime.Object) error
-type ChangeHandler func(gvr schema2.GroupVersionKind, key string, obj, oldObj runtime.Object) error
+type (
+	Handler       func(gvr schema2.GroupVersionKind, key string, obj runtime.Object) error
+	ChangeHandler func(gvr schema2.GroupVersionKind, key string, obj, oldObj runtime.Object) error
+)
 
 type ClusterCache interface {
 	Get(gvk schema2.GroupVersionKind, namespace, name string) (interface{}, bool, error)
@@ -127,7 +129,6 @@ func (h *clusterCache) addResourceEventHandler(gvk schema2.GroupVersionKind, inf
 
 func (h *clusterCache) OnSchemas(schemas *schema.Collection) error {
 	h.Lock()
-	defer h.Unlock()
 
 	var (
 		gvks   = map[schema2.GroupVersionKind]bool{}
@@ -182,18 +183,38 @@ func (h *clusterCache) OnSchemas(schemas *schema.Collection) error {
 		}
 	}
 
+	h.Unlock()
+
 	for _, w := range toWait {
-		ctx, cancel := context.WithTimeout(w.ctx, 15*time.Minute)
-		if !cache.WaitForCacheSync(ctx.Done(), w.informer.HasSynced) {
-			logrus.Errorf("failed to sync cache for %v", w.gvk)
-			cancel()
-			w.cancel()
-			delete(h.watchers, w.gvk)
-		}
-		cancel()
+		go h.waitForSync(w)
 	}
 
 	return nil
+}
+
+func (h *clusterCache) waitForSync(w *watcher) {
+	ctx, cancel := context.WithTimeout(w.ctx, 15*time.Minute)
+	defer cancel()
+
+	if cache.WaitForCacheSync(ctx.Done(), w.informer.HasSynced) {
+		return
+	}
+	if w.ctx.Err() != nil {
+		// Watcher was already stopped by a later schema refresh (e.g. the
+		// resource is no longer valid) - not a genuine sync failure.
+		return
+	}
+
+	logrus.Errorf("failed to sync cache for %v", w.gvk)
+
+	h.Lock()
+	defer h.Unlock()
+	// Only remove if this is still the current watcher for the GVK - a later
+	// refresh may have already replaced or removed it.
+	if h.watchers[w.gvk] == w {
+		w.cancel()
+		delete(h.watchers, w.gvk)
+	}
 }
 
 func (h *clusterCache) Get(gvk schema2.GroupVersionKind, namespace, name string) (interface{}, bool, error) {
